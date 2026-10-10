@@ -42,6 +42,9 @@ type Handler struct {
 
 	metadataMu      sync.Mutex
 	metadataFlights map[string]*metadataFetch
+	// publicBaseURL, when set, is the external base URL used to build served
+	// tarball links instead of the request scheme and Host header.
+	publicBaseURL string
 
 	// Lifecycle management for background goroutines
 	wg             sync.WaitGroup
@@ -79,6 +82,16 @@ func WithRouter(router *Router) HandlerOption {
 func WithDownloader(dl *download.Downloader) HandlerOption {
 	return func(h *Handler) {
 		h.downloader = dl
+	}
+}
+
+// WithPublicBaseURL sets the external base URL (e.g. https://cache.example.com)
+// used when rewriting tarball download links. When empty, the request scheme and
+// Host header are used. Set this when TLS is terminated by an upstream load
+// balancer, so the cache cannot infer https from the inbound request.
+func WithPublicBaseURL(baseURL string) HandlerOption {
+	return func(h *Handler) {
+		h.publicBaseURL = strings.TrimSuffix(baseURL, "/")
 	}
 }
 
@@ -236,11 +249,14 @@ func (h *Handler) rewriteTarballURLs(r *http.Request, meta map[string]any) {
 	}
 
 	// Determine our base URL
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
+	baseURL := h.publicBaseURL
+	if baseURL == "" {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
 	}
-	baseURL := fmt.Sprintf("%s://%s", scheme, r.Host)
 
 	for _, v := range versions {
 		version, ok := v.(map[string]any)

@@ -178,6 +178,12 @@ type Config struct {
 	// When both TLSCertFile and TLSKeyFile are set, the server starts with TLS.
 	TLSCertFile string
 
+	// PublicBaseURL is the external base URL (scheme://host[:port])
+	// clients use to reach this cache.
+	// When set, served download links (PyPI files, NPM tarballs) are built from it
+	// instead of the request scheme and Host header.
+	PublicBaseURL string
+
 	// TLSKeyFile is the path to the TLS private key file.
 	TLSKeyFile string
 
@@ -221,6 +227,7 @@ type Server struct {
 	httpcacheIndex  *httpcache.Index
 	httpcache       *httpcache.Handler
 	metaDB          metadb.MetaDB
+	metadataReapers *metadataReapers
 	gcManager       *gc.Manager
 	s3fifoManager   *s3fifo.Manager
 }
@@ -313,6 +320,13 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	expiryCheckInterval := cfg.ExpiryCheckInterval
+	if expiryCheckInterval <= 0 {
+		expiryCheckInterval = time.Hour
+	}
+	cfg.ExpiryCheckInterval = expiryCheckInterval
+	metadataReapers := newMetadataReapers(metaDB, expiryCheckInterval, cfg.Logger)
 
 	// Create a single shared EnvelopeCodec (zstd encoder/decoder) for all EnvelopeIndex instances.
 	sharedCodec, err := metadb.NewEnvelopeCodec(metadb.WithMaxPayloadSize(cfg.MetadataMaxSize))
@@ -417,11 +431,11 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	// Initialize goproxy components using metadb EnvelopeIndex
-	goproxyModIndex, err := metadb.NewEnvelopeIndex(metaDB, "goproxy", "mod", 24*time.Hour, withCodec)
+	goproxyModIndex, err := metadb.NewEnvelopeIndex(metaDB, "goproxy", "mod", 0, withCodec)
 	if err != nil {
 		return nil, fmt.Errorf("creating goproxy mod index: %w", err)
 	}
-	goproxyInfoIndex, err := metadb.NewEnvelopeIndex(metaDB, "goproxy", "info", 24*time.Hour, withCodec)
+	goproxyInfoIndex, err := metadb.NewEnvelopeIndex(metaDB, "goproxy", "info", 0, withCodec)
 	if err != nil {
 		return nil, fmt.Errorf("creating goproxy info index: %w", err)
 	}
@@ -482,6 +496,9 @@ func New(cfg Config) (*Server, error) {
 			npmUpstreamOpts = append(npmUpstreamOpts, npm.WithRegistryURL(cfg.UpstreamNPMRegistry))
 		}
 		npmHandlerOpts = append(npmHandlerOpts, npm.WithUpstream(npm.NewUpstream(npmUpstreamOpts...)))
+	}
+	if cfg.PublicBaseURL != "" {
+		npmHandlerOpts = append(npmHandlerOpts, npm.WithPublicBaseURL(cfg.PublicBaseURL))
 	}
 	npmHandler := npm.NewHandler(npmIndex, cafsStore, npmHandlerOpts...)
 
@@ -576,6 +593,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.PyPIMetadataTTL > 0 {
 		pypiHandlerOpts = append(pypiHandlerOpts, pypi.WithMetadataTTL(cfg.PyPIMetadataTTL))
+	}
+	if cfg.PublicBaseURL != "" {
+		pypiHandlerOpts = append(pypiHandlerOpts, pypi.WithPublicBaseURL(cfg.PublicBaseURL))
 	}
 	pypiHandler := pypi.NewHandler(pypiIndex, cafsStore, pypiHandlerOpts...)
 
@@ -833,6 +853,7 @@ func New(cfg Config) (*Server, error) {
 		httpcacheIndex:  httpcacheIdx,
 		httpcache:       httpcacheHndlr,
 		metaDB:          metaDB,
+		metadataReapers: metadataReapers,
 		gcManager:       gcManager,
 		s3fifoManager:   s3fifoMgr,
 	}
@@ -1079,6 +1100,13 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 
 // Start starts the server.
 func (s *Server) Start() error {
+	if s.metadataReapers != nil {
+		s.logger.Info("starting metadata expiry reapers",
+			"interval", s.config.ExpiryCheckInterval,
+		)
+		s.metadataReapers.Start(context.Background())
+	}
+
 	if s.s3fifoManager != nil {
 		s.logger.Info("starting S3-FIFO eviction manager")
 		s.s3fifoManager.Start(context.Background())
@@ -1094,16 +1122,29 @@ func (s *Server) Start() error {
 
 	if s.config.TLSCertFile != "" && s.config.TLSKeyFile != "" {
 		s.logger.Info("starting server with TLS", "address", s.config.Address)
-		return s.httpServer.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile)
+		err := s.httpServer.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile)
+		if s.metadataReapers != nil {
+			s.metadataReapers.Stop()
+		}
+		return err
 	}
 
 	s.logger.Info("starting server", "address", s.config.Address)
-	return s.httpServer.ListenAndServe()
+	err := s.httpServer.ListenAndServe()
+	if s.metadataReapers != nil {
+		s.metadataReapers.Stop()
+	}
+	return err
 }
 
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down server")
+
+	// Stop metadata expiry reapers before closing the HTTP server.
+	if s.metadataReapers != nil {
+		s.metadataReapers.Stop()
+	}
 
 	// Stop S3-FIFO eviction manager
 	if s.s3fifoManager != nil {
